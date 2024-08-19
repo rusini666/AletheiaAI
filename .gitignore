@@ -164,3 +164,4 @@ cython_debug/
 data/subtaskA_*_monolingual.jsonl
 data/subtaskA_*_multilingual.jsonl
 data/models/*
+data/predictions/*
