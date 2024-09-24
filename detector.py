@@ -570,7 +570,7 @@ def get_text_predictions(model, loader):
 #     return tokenizer, pretrained_model
 
 
-# Define the QLoRA model loader (without quantization)
+# Define the LoRA model loader (without quantization)
 def get_pretrained_model():
     # Load the tokenizer and add special tokens if needed
     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
@@ -580,7 +580,7 @@ def get_pretrained_model():
     # Load the base model without quantization
     pretrained_model = AutoModelForCausalLM.from_pretrained(app_configs['base_model'])
 
-    # Apply LoRA configuration (QLoRA without quantization)
+    # Apply LoRA configuration (LoRA without quantization)
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=8,  # Low-rank adaptation
@@ -648,7 +648,7 @@ def create_and_train():
     val_dataset = PreprocessDataset(val_df, tokenizer)
 
     train(myModel, train_dataset, val_dataset, app_configs['learning_rate'], app_configs['epochs'], app_configs['model_name'])
-    print("Training with QLoRA completed.")
+    print("Training with LoRA completed.")
 
 
 def creare_train_evaluate_vectorised():
