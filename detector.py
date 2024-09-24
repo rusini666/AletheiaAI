@@ -14,7 +14,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
 
-from transformers import XLMRobertaConfig, AutoTokenizer, AutoModel, AutoModelForMaskedLM, AutoConfig, AutoModelForCausalLM, OPTForCausalLM, get_linear_schedule_with_warmup
+from peft import get_peft_model, LoraConfig, TaskType
+from transformers import XLMRobertaConfig, AutoTokenizer, AutoModel, AutoModelForMaskedLM, AutoConfig, AutoModelForCausalLM, OPTForCausalLM, BitsAndBytesConfig, get_linear_schedule_with_warmup
 
 from tqdm import tqdm
 
@@ -437,124 +438,99 @@ def target_device():
     print("Use device:", device)
     return device
 
-def train(model, dataset, learning_rate, epochs, model_name):        
-    k = 5  # Number of splits for K-Fold
-    kf = KFold(n_splits=k, shuffle=True, random_state=42)  # K-Fold splitter
-    
-    device = app_configs['device']
+def train(model, train_dataset, val_dataset, learning_rate, epochs, model_name):
+    device = target_device()
     criterion = nn.BCEWithLogitsLoss()
     optimizer = AdamW(model.parameters(), lr=learning_rate)
-    
+
     model = model.to(device)
     criterion = criterion.to(device)
-    
-    # Initialize lists to track the average losses across all folds
-    avg_training_losses = np.zeros(epochs)
-    avg_validation_losses = np.zeros(epochs)
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
-        print(f'Fold {fold + 1}/{k}')
-        
-        train_subset = torch.utils.data.Subset(dataset, train_idx)
-        val_subset = torch.utils.data.Subset(dataset, val_idx)
-        
-        train_dataloader = DataLoader(train_subset, batch_size=8, shuffle=True, num_workers=0)
-        val_dataloader = DataLoader(val_subset, batch_size=8, num_workers=0)
+    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=8, shuffle=False)
 
-        total_steps = len(train_dataloader) * epochs
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+    total_steps = len(train_dataloader) * epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
 
-        fold_training_losses = []
-        fold_validation_losses = []
+    training_losses, validation_losses = [], []
+    training_accuracies, validation_accuracies = [], []
 
-        for epoch in range(epochs):
-            total_acc_train = 0
-            total_loss_train = 0
-            
-            model.train()
-            
-            for train_input, train_label in tqdm(train_dataloader):
-                optimizer.zero_grad()
-            
-                attention_mask = train_input['attention_mask'].to(device)
-                input_ids = train_input['input_ids'].squeeze(1).to(device)
-                
-                train_label = train_label.to(device)
+    for epoch in range(epochs):
+        total_loss_train, total_acc_train = 0, 0
+        model.train()
+
+        # Training loop with progress bar
+        for train_input, train_label in tqdm(train_dataloader, desc=f"Training Epoch {epoch+1}/{epochs}"):
+            optimizer.zero_grad()
+            attention_mask = train_input['attention_mask'].to(device)
+            input_ids = train_input['input_ids'].squeeze(1).to(device)
+            train_label = train_label.to(device)
+
+            output = model(input_ids, attention_mask)
+            loss = criterion(output, train_label.float().unsqueeze(1))
+            total_loss_train += loss.item()
+
+            acc = ((output >= 0.5).int() == train_label.unsqueeze(1)).sum().item()
+            total_acc_train += acc
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+        # Validation loop
+        total_loss_val, total_acc_val = 0, 0
+        model.eval()
+        with torch.no_grad():
+            for val_input, val_label in val_dataloader:
+                attention_mask = val_input['attention_mask'].to(device)
+                input_ids = val_input['input_ids'].squeeze(1).to(device)
+                val_label = val_label.to(device)
+
                 output = model(input_ids, attention_mask)
-                loss = criterion(output, train_label.float().unsqueeze(1))
-                total_loss_train += loss.item()
+                loss = criterion(output, val_label.float().unsqueeze(1))
+                total_loss_val += loss.item()
 
-                acc = ((output >= 0.5).int() == train_label.unsqueeze(1)).sum().item()
-                total_acc_train += acc
-                
-                loss.backward()
-                optimizer.step()   
-                scheduler.step()
+                acc = ((output >= 0.5).int() == val_label.unsqueeze(1)).sum().item()
+                total_acc_val += acc
 
-            # Validation step
-            with torch.no_grad():
-                total_acc_val = 0
-                total_loss_val = 0
-                
-                model.eval()
-                
-                for val_input, val_label in tqdm(val_dataloader):
-                    attention_mask = val_input['attention_mask'].to(device)
-                    input_ids = val_input['input_ids'].squeeze(1).to(device)
+        # Calculate average losses and accuracies
+        avg_train_loss = total_loss_train / len(train_dataloader)
+        avg_val_loss = total_loss_val / len(val_dataloader)
+        avg_train_acc = total_acc_train / len(train_dataloader.dataset)
+        avg_val_acc = total_acc_val / len(val_dataloader.dataset)
 
-                    val_label = val_label.to(device)
+        training_losses.append(avg_train_loss)
+        validation_losses.append(avg_val_loss)
+        training_accuracies.append(avg_train_acc)
+        validation_accuracies.append(avg_val_acc)
 
-                    output = model(input_ids, attention_mask)
+        print(f'Epoch: {epoch + 1} | Train Loss: {avg_train_loss:.3f} | Train Acc: {avg_train_acc:.3f} '
+              f'| Val Loss: {avg_val_loss:.3f} | Val Acc: {avg_val_acc:.3f}')
 
-                    loss = criterion(output, val_label.float().unsqueeze(1))
+        # Save the best model based on validation loss
+        if epoch == 0 or avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            os.makedirs(app_configs['models_path'], exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(app_configs['models_path'], f"{model_name}.pt"))
+            print("Best model saved.")
 
-                    total_loss_val += loss.item()
-
-                    acc = ((output >= 0.5).int() == val_label.unsqueeze(1)).sum().item()
-                    total_acc_val += acc
-
-            # Calculate average losses for this epoch
-            avg_train_loss = total_loss_train / len(train_dataloader)
-            avg_val_loss = total_loss_val / len(val_dataloader)
-            fold_training_losses.append(avg_train_loss)
-            fold_validation_losses.append(avg_val_loss)
-                
-            print(f'Epochs: {epoch + 1} '
-                  f'| Train Loss: {avg_train_loss: .3f} '
-                  f'| Train Accuracy: {total_acc_train / len(train_dataloader.dataset): .3f} '
-                  f'| Val Loss: {avg_val_loss: .3f} '
-                  f'| Val Accuracy: {total_acc_val / len(val_dataloader.dataset): .3f}')
-                
-            # Check if this is the best model so far and save it
-            if fold == 0 and epoch == 0:
-                best_val_loss = avg_val_loss
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                # Ensure the directory exists
-                os.makedirs(app_configs['models_path'], exist_ok=True)
-                torch.save(model, app_configs['models_path'] + model_name + f"_fold{fold+1}.pt")
-                print("Saved model")
-
-        # Add this fold's losses to the overall average losses
-        avg_training_losses += np.array(fold_training_losses)
-        avg_validation_losses += np.array(fold_validation_losses)
-
-        print(f'Completed Fold {fold + 1}/{k}')
-
-    # Divide by the number of folds to get the average
-    avg_training_losses /= k
-    avg_validation_losses /= k
-
-    print('Training completed across all folds.')
-
-    # Plot the training and validation losses
-    plt.figure(figsize=(10, 5))
-    plt.plot(avg_training_losses, label='Average Training Loss')
-    plt.plot(avg_validation_losses, label='Average Validation Loss')
+    # Plot the training and validation losses and accuracies
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(training_losses, label='Train Loss')
+    plt.plot(validation_losses, label='Val Loss')
     plt.xlabel('Epochs')
     plt.ylabel('Loss')
-    plt.title('Average Training and Validation Losses Across Folds')
     plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(training_accuracies, label='Train Accuracy')
+    plt.plot(validation_accuracies, label='Val Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+
+    plt.tight_layout()
     plt.show()
 
 def get_text_predictions(model, loader):
@@ -593,25 +569,51 @@ def get_text_predictions(model, loader):
 #     app_configs['pretrained_model'] = pretrained_model
 #     return tokenizer, pretrained_model
 
+
+# Define the QLoRA model loader (without quantization)
 def get_pretrained_model():
-    global app_configs
-    
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    # Load the tokenizer and add special tokens if needed
     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
-    
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
 
+    # Load the base model without quantization
     pretrained_model = AutoModelForCausalLM.from_pretrained(app_configs['base_model'])
+
+    # Apply LoRA configuration (QLoRA without quantization)
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=8,  # Low-rank adaptation
+        lora_alpha=32,
+        lora_dropout=0.1,
+        target_modules=["q_proj", "v_proj"]
+    )
+    
+    # Get the model with LoRA applied
+    model_with_lora = get_peft_model(pretrained_model, lora_config)
+    
+    return tokenizer, model_with_lora
+
+
+# def get_pretrained_model():
+#     global app_configs
+    
+#     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+#     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
+    
+#     if tokenizer.pad_token is None:
+#         tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+
+#     pretrained_model = AutoModelForCausalLM.from_pretrained(app_configs['base_model'])
         
-    app_configs['tokenizer'] = tokenizer
-    app_configs['pretrained_model'] = pretrained_model
-    return tokenizer, pretrained_model
+#     app_configs['tokenizer'] = tokenizer
+#     app_configs['pretrained_model'] = pretrained_model
+#     return tokenizer, pretrained_model
     
   
 def get_train_data(train_path, random_seed = 0):
     """
-    function to read dataframe with columns
+    Function to read dataframe with columns
     """
 
     train_df = pd.read_json(train_path, lines=True)
@@ -637,23 +639,17 @@ def get_train_val_test_data(full_dataset_path, train_size=0.7, val_size=0.2, tes
     return train_df, val_df, test_df
 
 def create_and_train():
-    # Load the full dataset and drop unnecessary columns
-    full_df = pd.read_json(app_configs['full_dataset_path'], lines=True)
-    full_df = full_df.drop(["model", "source"], axis=1)
+    train_df, val_df, test_df = get_train_val_test_data(app_configs['full_dataset_path'])
 
-    target_device()
     tokenizer, pretrained_model = get_pretrained_model()
 
-    classifierClass = str_to_class(app_configs['classifier'])
-    myModel = classifierClass(pretrained_model)
+    myModel = CustomOPTClassifier(pretrained_model)
+    train_dataset = PreprocessDataset(train_df, tokenizer)
+    val_dataset = PreprocessDataset(val_df, tokenizer)
 
-    # Prepare the full dataset
-    full_dataset = PreprocessDataset(full_df, tokenizer)
+    train(myModel, train_dataset, val_dataset, app_configs['learning_rate'], app_configs['epochs'], app_configs['model_name'])
+    print("Training with QLoRA completed.")
 
-    # Train the model using K-Fold cross-validation
-    train(myModel, full_dataset, app_configs['learning_rate'], app_configs['epochs'], app_configs['model_name'])
-
-    print("KFold cross-validation completed.")
 
 def creare_train_evaluate_vectorised():
     target_device()    
@@ -689,12 +685,21 @@ def load_and_evaluate(model_name=''):
     # Drop unnecessary columns
     test_df = test_df.drop(["model", "source"], axis=1)
 
+    # Initialize the model architecture first
     target_device()
     tokenizer, pretrained_model = get_pretrained_model()
 
+    # Recreate the model architecture
+    classifierClass = str_to_class(app_configs['classifier'])
+    model = classifierClass(pretrained_model)
+
+    # Load the saved state_dict into the model architecture
     model_path = app_configs['models_path'] + app_configs['model_name'] + ".pt"
-    model = torch.load(model_path)
-    print("model loaded:", model_path)
+    model.load_state_dict(torch.load(model_path))  # Loading the state dict properly
+    print("Model loaded successfully from:", model_path)
+
+    # Move the model to the correct device
+    model = model.to(app_configs['device'])
 
     predictions_df = pd.DataFrame({'id': test_df['id']})
     test_dataloader = DataLoader(PreprocessDataset(test_df, tokenizer), batch_size=8, shuffle=False, num_workers=0)
@@ -789,47 +794,11 @@ albert_model_configs1 = {
     'classifier': 'CustomClassifierAlbert',
 }
 
-
-'''
-NOT IN SCOPE 
-
-robertamultilang_model_configs1 = {
-    'base_model': 'FacebookAI/xlm-roberta-base',
-    'classifier': 'CustomClassifierBase', 
-    'train_path': absolute_path + '/subtaskA_train_multilingual.jsonl',
-    'test_path': absolute_path + '/subtaskA_dev_multilingual.jsonl',
-}
-
-robertalargemultilang_model_configs1 = {
-    'base_model': 'FacebookAI/xlm-roberta-large',    
-    'classifier': 'CustomClassifierRobertaLarge', 
-    'train_path': absolute_path + '/subtaskA_train_multilingual.jsonl',
-    'test_path': absolute_path + '/subtaskA_dev_multilingual.jsonl',
-}
-
-distilbertmultilang_model_configs1 = {
-    'base_model': 'distilbert-base-multilingual-cased',
-    'classifier': 'CustomClassifierBase', 
-    'train_path': absolute_path + '/subtaskA_train_multilingual.jsonl',
-    'test_path': absolute_path + '/subtaskA_dev_multilingual.jsonl',
-}
-
-bertmultilang_model_configs1 = {
-    'base_model': 'bert-base-multilingual-cased',
-    'classifier': 'CustomClassifierBase', 
-    'train_path': absolute_path + '/subtaskA_train_multilingual.jsonl',
-    'test_path': absolute_path + '/subtaskA_dev_multilingual.jsonl',
-}
-
-'''
-
 default_configs = {
     'learning_rate': 1e-5,
     'epochs': 5,
     'task': 'subtaskA_monolingual',
     'timestamp_prefix': timestamp_prefix,
-    # 'train_path': absolute_path + '/subtaskA_train_monolingual.jsonl',
-    # 'test_path': absolute_path + '/subtaskA_dev_monolingual.jsonl',
     'full_dataset_path': absolute_path + '/subtaskA_dataset_monolingual.jsonl',
     'percent_of_data': 100,
     'options_path': absolute_path + '/predictions/'  + 'tests.results.jsonl',
@@ -858,7 +827,7 @@ print("Working on pretrained-model:", app_configs['base_model'])
 #creare_train_evaluate_vectorised()
 #exit()
 #model_for_evaluate='202402061024_subtaskA_monolingual_roberta-base'
-model_for_evaluate=''
+model_for_evaluate='202409230028_subtaskA_monolingual_facebook_opt-1.3b'
 # create_and_train()
 # load_and_evaluate(model_for_evaluate)
 
