@@ -1,3 +1,12 @@
+import re
+import string
+import json
+from datetime import datetime
+import types
+import pickle
+import os
+os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -9,13 +18,15 @@ from torch.optim import Adam, AdamW
 from torch.utils.data import DataLoader
 
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split, KFold
-from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay, precision_recall_fscore_support
 
 from peft import get_peft_model, LoraConfig, TaskType
-from transformers import XLMRobertaConfig, AutoTokenizer, AutoModel, AutoModelForMaskedLM, AutoConfig, AutoModelForCausalLM, OPTForCausalLM, BitsAndBytesConfig, get_linear_schedule_with_warmup
+from transformers import XLMRobertaConfig, AutoTokenizer, AutoModel, AutoModelForMaskedLM, AutoModelForSequenceClassification, AutoConfig, AutoModelForCausalLM, OPTForCausalLM, get_linear_schedule_with_warmup
 
 from tqdm import tqdm
 
@@ -23,6 +34,10 @@ import sentencepiece
 
 import nltk
 import ssl
+
+from datasets import load_dataset
+
+ds = load_dataset("artem9k/ai-text-detection-pile")
 
 try:
     _create_unverified_https_context = ssl._create_unverified_context
@@ -33,18 +48,6 @@ else:
 
 nltk.download('punkt')
 nltk.download('stopwords')
-
-import re
-import string
-import json
-from datetime import datetime
-import types
-import pickle
-import os
-os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
-#from transformers import file_utils
-#print(file_utils.default_cache_path)
-#exit()
 
 app_configs = {}
 
@@ -159,27 +162,12 @@ class PreprocessDataset(Dataset):
 class CustomClassifierBase(nn.Module):
     def __init__(self, pretrained_model):
         super(CustomClassifierBase, self).__init__()
+        self.bert = pretrained_model  # Use pretrained DistilBERT directly
 
-        self.bert = pretrained_model
-        self.fc1 = nn.Linear(768, 32)
-        self.fc2 = nn.Linear(32, 1)
-
-        self.relu = nn.ReLU()
-        # self.sigmoid = nn.Sigmoid()
-        
     def forward(self, input_ids, attention_mask):
-        # Ensure the attention_mask has the correct shape
-        attention_mask = attention_mask.squeeze(1)
-
-        # Pass inputs through the BERT model
-        bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)[0][:, 0]
-        
-        x = self.fc1(bert_out)
-        x = self.relu(x)
-        x = self.fc2(x)
-        # x = self.sigmoid(x)
-
-        return x
+        # Directly use the logits from the pretrained model
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        return outputs.logits
 
 class CustomLlamaClassifier(nn.Module):
     def __init__(self, pretrained_model):
@@ -208,24 +196,13 @@ class CustomLlamaClassifier(nn.Module):
 class CustomClassifierRobertaLarge(nn.Module):
     def __init__(self, pretrained_model):
         super(CustomClassifierRobertaLarge, self).__init__()
-
         self.bert = pretrained_model
-        self.fc1 = nn.Linear(1024, 8)
-        self.fc2 = nn.Linear(8, 1)
 
-        self.relu = nn.ReLU()
-        # self.sigmoid = nn.Sigmoid()
-        
     def forward(self, input_ids, attention_mask):
-        bert_out = self.bert(input_ids=input_ids,
-                             attention_mask=attention_mask)[0][:, 0]
-        x = self.fc1(bert_out)
-        x = self.relu(x)
-        
-        x = self.fc2(x)
-        # x = self.sigmoid(x)
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        # Directly use logits for classification
+        return outputs.logits  # logits shape: (batch_size, num_labels)
 
-        return x
 
 class CustomClassifier2(nn.Module):
     def __init__(self, pretrained_model):
@@ -440,8 +417,13 @@ def target_device():
 
 def train(model, train_dataset, val_dataset, learning_rate, epochs, model_name):
     device = target_device()
+
+    # Define a loss function suitable for binary classification
     criterion = nn.BCEWithLogitsLoss()
+
+    # Initialize an optimizer (AdamW) to update model parameters
     optimizer = AdamW(model.parameters(), lr=learning_rate)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=len(train_dataset) * epochs)
 
     model = model.to(device)
     criterion = criterion.to(device)
@@ -449,9 +431,7 @@ def train(model, train_dataset, val_dataset, learning_rate, epochs, model_name):
     train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=8, shuffle=False)
 
-    total_steps = len(train_dataloader) * epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
-
+    best_val_loss = float('inf')
     training_losses, validation_losses = [], []
     training_accuracies, validation_accuracies = [], []
 
@@ -459,41 +439,36 @@ def train(model, train_dataset, val_dataset, learning_rate, epochs, model_name):
         total_loss_train, total_acc_train = 0, 0
         model.train()
 
-        # Training loop with progress bar
         for train_input, train_label in tqdm(train_dataloader, desc=f"Training Epoch {epoch+1}/{epochs}"):
             optimizer.zero_grad()
             attention_mask = train_input['attention_mask'].to(device)
             input_ids = train_input['input_ids'].squeeze(1).to(device)
-            train_label = train_label.to(device)
+            train_label = train_label.float().unsqueeze(1).to(device)
 
+            # Forward pass
             output = model(input_ids, attention_mask)
-            loss = criterion(output, train_label.float().unsqueeze(1))
-            total_loss_train += loss.item()
-
-            acc = ((output >= 0.5).int() == train_label.unsqueeze(1)).sum().item()
-            total_acc_train += acc
-
+            loss = criterion(output, train_label)
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-        # Validation loop
+            total_loss_train += loss.item()
+            total_acc_train += ((output >= 0.5).int() == train_label).sum().item()
+
         total_loss_val, total_acc_val = 0, 0
         model.eval()
         with torch.no_grad():
             for val_input, val_label in val_dataloader:
                 attention_mask = val_input['attention_mask'].to(device)
                 input_ids = val_input['input_ids'].squeeze(1).to(device)
-                val_label = val_label.to(device)
+                val_label = val_label.float().unsqueeze(1).to(device)
 
                 output = model(input_ids, attention_mask)
-                loss = criterion(output, val_label.float().unsqueeze(1))
+                loss = criterion(output, val_label)
                 total_loss_val += loss.item()
+                total_acc_val += ((output >= 0.5).int() == val_label).sum().item()
 
-                acc = ((output >= 0.5).int() == val_label.unsqueeze(1)).sum().item()
-                total_acc_val += acc
-
-        # Calculate average losses and accuracies
+        # Calculate epoch statistics
         avg_train_loss = total_loss_train / len(train_dataloader)
         avg_val_loss = total_loss_val / len(val_dataloader)
         avg_train_acc = total_acc_train / len(train_dataloader.dataset)
@@ -504,30 +479,29 @@ def train(model, train_dataset, val_dataset, learning_rate, epochs, model_name):
         training_accuracies.append(avg_train_acc)
         validation_accuracies.append(avg_val_acc)
 
-        print(f'Epoch: {epoch + 1} | Train Loss: {avg_train_loss:.3f} | Train Acc: {avg_train_acc:.3f} '
-              f'| Val Loss: {avg_val_loss:.3f} | Val Acc: {avg_val_acc:.3f}')
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.3f} | Train Acc: {avg_train_acc:.3f} "
+              f"| Val Loss: {avg_val_loss:.3f} | Val Acc: {avg_val_acc:.3f}")
 
-        # Save the best model based on validation loss
-        if epoch == 0 or avg_val_loss < best_val_loss:
+        # Save best model
+        if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            os.makedirs(app_configs['models_path'], exist_ok=True)
             torch.save(model.state_dict(), os.path.join(app_configs['models_path'], f"{model_name}.pt"))
             print("Best model saved.")
 
-    # Plot the training and validation losses and accuracies
+    # Plot the results
     plt.figure(figsize=(12, 6))
     plt.subplot(1, 2, 1)
-    plt.plot(training_losses, label='Train Loss')
-    plt.plot(validation_losses, label='Val Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
+    plt.plot(training_losses, label="Train Loss")
+    plt.plot(validation_losses, label="Val Loss")
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
     plt.legend()
 
     plt.subplot(1, 2, 2)
-    plt.plot(training_accuracies, label='Train Accuracy')
-    plt.plot(validation_accuracies, label='Val Accuracy')
-    plt.xlabel('Epochs')
-    plt.ylabel('Accuracy')
+    plt.plot(training_accuracies, label="Train Accuracy")
+    plt.plot(validation_accuracies, label="Val Accuracy")
+    plt.xlabel("Epochs")
+    plt.ylabel("Accuracy")
     plt.legend()
 
     plt.tight_layout()
@@ -551,65 +525,58 @@ def get_text_predictions(model, loader):
             results_predictions.append(output)
     
     return torch.cat(results_predictions).cpu().detach().numpy()
-    
+
 # def get_pretrained_model():
-#     global app_configs
-    
-#     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+#     # Load the tokenizer and add special tokens if needed
 #     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
+#     if tokenizer.pad_token is None:
+#         tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+
+#     # Load the base model without quantization
+#     pretrained_model = AutoModelForCausalLM.from_pretrained(app_configs['base_model'])
+
+#     # Apply LoRA configuration (LoRA without quantization)
+#     lora_config = LoraConfig(
+#         task_type=TaskType.CAUSAL_LM,
+#         r=8,  # Low-rank adaptation
+#         lora_alpha=32,
+#         lora_dropout=0.1,
+#         target_modules=["q_proj", "v_proj"]
+#     )
     
-#     if (app_configs['base_model'] == 'xlm-roberta-base'):
-#         print("load xlm")
-#         exit()
-#         pretrained_model = AutoModelForMaskedLM.from_pretrained(app_configs['base_model'])
-#     else:
-#         pretrained_model = AutoModel.from_pretrained(app_configs['base_model'])
-        
-#     app_configs['tokenizer'] = tokenizer
-#     app_configs['pretrained_model'] = pretrained_model
-#     return tokenizer, pretrained_model
+#     # Get the model with LoRA applied
+#     model_with_lora = get_peft_model(pretrained_model, lora_config)
+    
+#     return tokenizer, model_with_lora
 
-
-# Define the LoRA model loader (without quantization)
 def get_pretrained_model():
+    """Load the tokenizer and pretrained model with LoRA configuration."""
+    print("Loading model and tokenizer...")  # Debug log
+
     # Load the tokenizer and add special tokens if needed
     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
 
-    # Load the base model without quantization
-    pretrained_model = AutoModelForCausalLM.from_pretrained(app_configs['base_model'])
+    # Use AutoModelForSequenceClassification for classification tasks
+    pretrained_model = AutoModelForSequenceClassification.from_pretrained(
+        app_configs['base_model'],
+        num_labels=1  # For binary classification
+    )
 
-    # Apply LoRA configuration (LoRA without quantization)
+    # Apply LoRA configuration if needed
     lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=8,  # Low-rank adaptation
+        task_type=TaskType.SEQ_CLS,  # Sequence classification task
+        r=8,
         lora_alpha=32,
         lora_dropout=0.1,
-        target_modules=["q_proj", "v_proj"]
+        target_modules=["q_proj", "v_proj"] if "opt" in app_configs['base_model'] else None
     )
-    
-    # Get the model with LoRA applied
-    model_with_lora = get_peft_model(pretrained_model, lora_config)
-    
+
+    # Use LoRA only if it applies (e.g., for OPT models)
+    model_with_lora = get_peft_model(pretrained_model, lora_config) if "opt" in app_configs['base_model'] else pretrained_model
+
     return tokenizer, model_with_lora
-
-
-# def get_pretrained_model():
-#     global app_configs
-    
-#     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-#     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
-    
-#     if tokenizer.pad_token is None:
-#         tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-
-#     pretrained_model = AutoModelForCausalLM.from_pretrained(app_configs['base_model'])
-        
-#     app_configs['tokenizer'] = tokenizer
-#     app_configs['pretrained_model'] = pretrained_model
-#     return tokenizer, pretrained_model
-    
   
 def get_train_data(train_path, random_seed = 0):
     """
@@ -639,17 +606,23 @@ def get_train_val_test_data(full_dataset_path, train_size=0.7, val_size=0.2, tes
     return train_df, val_df, test_df
 
 def create_and_train():
+    # Split the data into train, validation, and test
     train_df, val_df, test_df = get_train_val_test_data(app_configs['full_dataset_path'])
 
+    # Get tokenizer and model
     tokenizer, pretrained_model = get_pretrained_model()
 
-    myModel = CustomOPTClassifier(pretrained_model)
+    # Dynamically select the classifier class
+    classifierClass = str_to_class(app_configs['classifier'])
+    myModel = classifierClass(pretrained_model)
+
+    # Prepare datasets
     train_dataset = PreprocessDataset(train_df, tokenizer)
     val_dataset = PreprocessDataset(val_df, tokenizer)
 
+    # Train the model
     train(myModel, train_dataset, val_dataset, app_configs['learning_rate'], app_configs['epochs'], app_configs['model_name'])
-    print("Training with LoRA completed.")
-
+    print("Training completed.")
 
 def creare_train_evaluate_vectorised():
     target_device()    
@@ -703,16 +676,94 @@ def load_and_evaluate(model_name=''):
 
     predictions_df = pd.DataFrame({'id': test_df['id']})
     test_dataloader = DataLoader(PreprocessDataset(test_df, tokenizer), batch_size=8, shuffle=False, num_workers=0)
+
+    # Now print the total samples and batches in the test dataloader
+    print("Total samples in test_dataloader:", len(test_dataloader.dataset))
+    print("Total batches in test_dataloader:", len(test_dataloader))
+
     predictions_df['label'] = get_text_predictions(model, test_dataloader)
 
     predictions_df.to_json(app_configs['prediction_path'], lines=True, orient='records')
     merged_df = predictions_df.merge(test_df, on='id', suffixes=('_pred', '_gold'))
+
     accuracy = accuracy_score(merged_df['label_gold'], merged_df['label_pred'])
+    precision, recall, f1, _ = precision_recall_fscore_support(merged_df['label_gold'], merged_df['label_pred'], average='weighted')
+
     app_configs['accuracy'] = accuracy
     print("Accuracy:", accuracy)
+    print("Precision:", precision)
+    print("Recall:", recall)
+    print("F1-Score:", f1)
     print(classification_report(merged_df['label_gold'], merged_df['label_pred']))
 
     # Compute and display the confusion matrix
+    # cm = confusion_matrix(merged_df['label_gold'], merged_df['label_pred'])
+    # disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
+    # disp.plot(cmap=plt.cm.Blues)
+    # plt.title('Confusion Matrix')
+    # plt.show()
+
+    if not model_name:
+        save_app_options()
+
+def load_and_evaluate_hf_dataset(model_name=''):
+    # Set model name if provided
+    if model_name:
+        app_configs['model_name'] = model_name
+
+    # Load the Hugging Face dataset (only 'train' split is available)
+    dataset = load_dataset("artem9k/ai-text-detection-pile", split='train')
+    df = pd.DataFrame(dataset) 
+
+    # Convert `source` to binary labels: 0 for human, 1 for AI-generated
+    df['label'] = df['source'].apply(lambda x: 1 if x == 'ai' else 0)
+
+    # Sample only 10% of the data for evaluation
+    df = df.sample(frac=0.1, random_state=42).reset_index(drop=True)
+
+    # Only use test_df for evaluation
+    test_df = df[['id', 'text', 'label']]
+
+    # Initialize the model and tokenizer
+    target_device()
+    tokenizer, pretrained_model = get_pretrained_model()
+
+    # Recreate the model architecture
+    classifierClass = str_to_class(app_configs['classifier'])
+    model = classifierClass(pretrained_model)
+
+    # Load the saved model
+    model_path = os.path.join(app_configs['models_path'], app_configs['model_name'] + ".pt")
+    model.load_state_dict(torch.load(model_path, map_location=app_configs['device']))
+    print("Model loaded successfully from:", model_path)
+
+    # Move the model to the correct device
+    model = model.to(app_configs['device'])
+
+    # Prepare DataLoader for Hugging Face dataset
+    test_dataloader = DataLoader(PreprocessDataset(test_df, tokenizer), batch_size=8, shuffle=False, num_workers=0)
+
+    # Add these print statements to check total samples and batches
+    print("Total samples in test_dataloader:", len(test_dataloader.dataset))
+    print("Total batches in test_dataloader:", len(test_dataloader))
+
+    # Generate predictions
+    predictions_df = pd.DataFrame({'id': test_df['id']})
+    predictions_df['label'] = get_text_predictions(model, test_dataloader)
+
+    # Calculate metrics
+    merged_df = predictions_df.merge(test_df, on='id', suffixes=('_pred', '_gold'))
+    accuracy = accuracy_score(merged_df['label_gold'], merged_df['label_pred'])
+    precision, recall, f1, _ = precision_recall_fscore_support(merged_df['label_gold'], merged_df['label_pred'], average='weighted')
+
+    # Print metrics
+    print("Accuracy:", accuracy)
+    print("Precision:", precision)
+    print("Recall:", recall)
+    print("F1-Score:", f1)
+    print(classification_report(merged_df['label_gold'], merged_df['label_pred']))
+
+    # Optionally display the confusion matrix
     cm = confusion_matrix(merged_df['label_gold'], merged_df['label_pred'])
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
     disp.plot(cmap=plt.cm.Blues)
@@ -749,13 +800,13 @@ np.random.seed(0)
 absolute_path = os.path.abspath('/Users/rusinitharagunarathne/Documents/AletheiaAI/data')
 
 opt_model_configs = {
-    'base_model': 'facebook/opt-1.3b',  # Replace with the specific OPT model you want
+    'base_model': 'facebook/opt-1.3b',
     'classifier': 'CustomOPTClassifier',
     'learning_rate': 1e-5,
 }
 
 llama_model_configs1 = {
-    'base_model': 'meta-llama/Llama-2-7b-hf',  # Adjust the model name as per your requirement
+    'base_model': 'meta-llama/Llama-2-7b-hf',
     'classifier': 'CustomLlamaClassifier',
     'learning_rate': 1e-5,
 }
@@ -807,7 +858,7 @@ default_configs = {
 
 
 app_configs = default_configs.copy()
-app_configs.update(opt_model_configs)
+app_configs.update(distilbert_model_configs1)
 
 app_configs['model_name'] = app_configs['timestamp_prefix'] + "_" + app_configs['task'] + "_" + app_configs['base_model'].replace("/", "_")
 app_configs['prediction_path'] = absolute_path + '/predictions/' + app_configs['model_name'] + '.predictions.jsonl'
@@ -816,25 +867,13 @@ app_configs['results_path'] = absolute_path + '/predictions/'  + app_configs['mo
 
 print("Working on pretrained-model:", app_configs['base_model'])
 
-#model names that can be used for evaluation:
-#model name roberta-large trained = 202401112145_subtaskA_monolingual_roberta-large
-#model name roberta-base trained = 202402061024_subtaskA_monolingual_roberta
-#model name for distilbert-base-uncased trained = 202401120919_subtaskA_monolingual_distilbert-base-uncased - 2 layers
-
-#multilang tests
-#model name for xlm_roberta_base = 202401201729_subtaskA_multilingual_FacebookAI_xlm-roberta-base
-#model name for distilbert-base-multilingual-cased = 202401231736_subtaskA_monolingual_distilbert-base-multilingual-cased.options.jsonl
-#creare_train_evaluate_vectorised()
-#exit()
-#model_for_evaluate='202402061024_subtaskA_monolingual_roberta-base'
-model_for_evaluate='202409230028_subtaskA_monolingual_facebook_opt-1.3b'
-# create_and_train()
-# load_and_evaluate(model_for_evaluate)
+model_for_evaluate=''
 
 # Conditional logic for training or evaluating
 if model_for_evaluate:
     print(f"Evaluating model: {model_for_evaluate}")
-    load_and_evaluate(model_for_evaluate)
+    # load_and_evaluate(model_for_evaluate)
+    load_and_evaluate_hf_dataset(model_for_evaluate)
 else:
     print("Training a new model...")
     create_and_train()
