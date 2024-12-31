@@ -407,13 +407,13 @@ def str_to_class(s):
     
 
 def target_device():
-    #gpu support for Mac
+    """Determine the device to use for training and evaluation."""
     use_mps = torch.backends.mps.is_available()
-    use_cuda = torch.cuda.is_available()        
-    device = torch.device("cuda" if use_cuda else "mps" if use_mps else "cpu")    
+    device = torch.device("mps" if use_mps else "cpu")
     app_configs['device'] = device
-    print("Use device:", device)
+    print(f"Using device: {device}")
     return device
+
 
 def train(model, train_dataset, val_dataset, learning_rate, epochs, model_name):
     device = target_device()
@@ -509,74 +509,75 @@ def train(model, train_dataset, val_dataset, learning_rate, epochs, model_name):
 
 def get_text_predictions(model, loader):
     device = app_configs['device']
-    model = model.to(device)
-    
+    # Move model to MPS (or device) and set float precision if needed
+    model = model.to(device).float()
+
     results_predictions = []
     with torch.no_grad():
         model.eval()
         for data_input, _ in tqdm(loader):
             attention_mask = data_input['attention_mask'].to(device)
-            input_ids = data_input['input_ids'].squeeze(1).to(device)
 
+            # Keep input_ids as int64
+            input_ids = data_input['input_ids'].squeeze(1).to(device)
+            input_ids = input_ids.long()
 
             output = model(input_ids, attention_mask)
-            
+            # output: shape (batch_size, 1) if your final layer has 1 output
             output = (output > 0.5).int()
             results_predictions.append(output)
-    
-    return torch.cat(results_predictions).cpu().detach().numpy()
 
-# def get_pretrained_model():
-#     # Load the tokenizer and add special tokens if needed
-#     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
-#     if tokenizer.pad_token is None:
-#         tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+    # Combine predictions into a single NumPy array
+    predictions = torch.cat(results_predictions).cpu().numpy()
 
-#     # Load the base model without quantization
-#     pretrained_model = AutoModelForCausalLM.from_pretrained(app_configs['base_model'])
+    # If shape is (N, 1), squeeze it to (N)
+    if predictions.ndim == 2 and predictions.shape[1] == 1:
+        predictions = predictions.squeeze(axis=1)
 
-#     # Apply LoRA configuration (LoRA without quantization)
-#     lora_config = LoraConfig(
-#         task_type=TaskType.CAUSAL_LM,
-#         r=8,  # Low-rank adaptation
-#         lora_alpha=32,
-#         lora_dropout=0.1,
-#         target_modules=["q_proj", "v_proj"]
-#     )
-    
-#     # Get the model with LoRA applied
-#     model_with_lora = get_peft_model(pretrained_model, lora_config)
-    
-#     return tokenizer, model_with_lora
+    return predictions
 
+""" For OPT model """
 def get_pretrained_model():
-    """Load the tokenizer and pretrained model with LoRA configuration."""
-    print("Loading model and tokenizer...")  # Debug log
-
     # Load the tokenizer and add special tokens if needed
     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
 
-    # Use AutoModelForSequenceClassification for classification tasks
-    pretrained_model = AutoModelForSequenceClassification.from_pretrained(
-        app_configs['base_model'],
-        num_labels=1  # For binary classification
-    )
+    # Load the base model without quantization
+    pretrained_model = AutoModelForCausalLM.from_pretrained(app_configs['base_model'])
 
-    # Apply LoRA configuration if needed
+    # Apply LoRA configuration (LoRA without quantization)
     lora_config = LoraConfig(
-        task_type=TaskType.SEQ_CLS,  # Sequence classification task
-        r=8,
+        task_type=TaskType.CAUSAL_LM,
+        r=8,  # Low-rank adaptation
         lora_alpha=32,
         lora_dropout=0.1,
-        target_modules=["q_proj", "v_proj"] if "opt" in app_configs['base_model'] else None
+        target_modules=["q_proj", "v_proj"]
     )
-
-    # Use LoRA only if it applies (e.g., for OPT models)
-    model_with_lora = get_peft_model(pretrained_model, lora_config) if "opt" in app_configs['base_model'] else pretrained_model
-
+    
+    # Get the model with LoRA applied
+    model_with_lora = get_peft_model(pretrained_model, lora_config)
+    
     return tokenizer, model_with_lora
+
+""" For other transformer models """
+# def get_pretrained_model():
+#     """Load the tokenizer and pretrained model."""
+#     print("Loading model and tokenizer...")  # Debug log
+
+#     # Load the tokenizer
+#     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
+#     if tokenizer.pad_token is None:
+#         tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+
+#     # Use AutoModelForSequenceClassification for classification tasks
+#     pretrained_model = AutoModelForSequenceClassification.from_pretrained(
+#         app_configs['base_model'],
+#         num_labels=1,  # Binary classification
+#         ignore_mismatched_sizes=True  # Ignore size mismatches during weight loading
+#     )
+
+#     return tokenizer, pretrained_model
   
 def get_train_data(train_path, random_seed = 0):
     """
@@ -652,56 +653,53 @@ def load_and_evaluate(model_name=''):
     if model_name:
         app_configs['model_name'] = model_name
 
-    # Load the full dataset and split into train, validation, and test sets
+    # Load the dataset
     _, _, test_df = get_train_val_test_data(app_configs['full_dataset_path'])
+    test_df = test_df.drop(["model", "source"], axis=1, errors='ignore')
 
-    # Drop unnecessary columns
-    test_df = test_df.drop(["model", "source"], axis=1)
+    # Set the device
+    device = target_device()
 
-    # Initialize the model architecture first
-    target_device()
+    # Load tokenizer and model
     tokenizer, pretrained_model = get_pretrained_model()
 
-    # Recreate the model architecture
+    # Create classifier
     classifierClass = str_to_class(app_configs['classifier'])
     model = classifierClass(pretrained_model)
 
-    # Load the saved state_dict into the model architecture
-    model_path = app_configs['models_path'] + app_configs['model_name'] + ".pt"
-    model.load_state_dict(torch.load(model_path))  # Loading the state dict properly
-    print("Model loaded successfully from:", model_path)
+    # Load model weights and move to device
+    model_path = os.path.join(app_configs['models_path'], f"{app_configs['model_name']}.pt")
+    # Force CPU load
+    model.load_state_dict(
+        torch.load(model_path, map_location=torch.device('cpu'))
+    )
 
-    # Move the model to the correct device
-    model = model.to(app_configs['device'])
+    # Then move the model to MPS
+    model = model.to(torch.device("mps"))
+    print(f"Model loaded successfully from: {model_path}")
+    model = model.to(torch.device("mps")).float()
 
-    predictions_df = pd.DataFrame({'id': test_df['id']})
-    test_dataloader = DataLoader(PreprocessDataset(test_df, tokenizer), batch_size=8, shuffle=False, num_workers=0)
+    # Create DataLoader
+    test_dataset = PreprocessDataset(test_df, tokenizer)
+    test_dataloader = DataLoader(test_dataset, batch_size=8, shuffle=False)
 
-    # Now print the total samples and batches in the test dataloader
-    print("Total samples in test_dataloader:", len(test_dataloader.dataset))
-    print("Total batches in test_dataloader:", len(test_dataloader))
+    # Generate predictions
+    predictions = get_text_predictions(model, test_dataloader)
 
-    predictions_df['label'] = get_text_predictions(model, test_dataloader)
-
-    predictions_df.to_json(app_configs['prediction_path'], lines=True, orient='records')
+    # Evaluate and log metrics
+    predictions_df = pd.DataFrame({'id': test_df['id'], 'label': predictions})
     merged_df = predictions_df.merge(test_df, on='id', suffixes=('_pred', '_gold'))
 
     accuracy = accuracy_score(merged_df['label_gold'], merged_df['label_pred'])
-    precision, recall, f1, _ = precision_recall_fscore_support(merged_df['label_gold'], merged_df['label_pred'], average='weighted')
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        merged_df['label_gold'], merged_df['label_pred'], average='weighted'
+    )
 
-    app_configs['accuracy'] = accuracy
-    print("Accuracy:", accuracy)
-    print("Precision:", precision)
-    print("Recall:", recall)
-    print("F1-Score:", f1)
+    print(f"Accuracy: {accuracy}")
+    print(f"Precision: {precision}")
+    print(f"Recall: {recall}")
+    print(f"F1-Score: {f1}")
     print(classification_report(merged_df['label_gold'], merged_df['label_pred']))
-
-    # Compute and display the confusion matrix
-    # cm = confusion_matrix(merged_df['label_gold'], merged_df['label_pred'])
-    # disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
-    # disp.plot(cmap=plt.cm.Blues)
-    # plt.title('Confusion Matrix')
-    # plt.show()
 
     if not model_name:
         save_app_options()
@@ -858,7 +856,7 @@ default_configs = {
 
 
 app_configs = default_configs.copy()
-app_configs.update(distilbert_model_configs1)
+app_configs.update(opt_model_configs)
 
 app_configs['model_name'] = app_configs['timestamp_prefix'] + "_" + app_configs['task'] + "_" + app_configs['base_model'].replace("/", "_")
 app_configs['prediction_path'] = absolute_path + '/predictions/' + app_configs['model_name'] + '.predictions.jsonl'
@@ -867,13 +865,13 @@ app_configs['results_path'] = absolute_path + '/predictions/'  + app_configs['mo
 
 print("Working on pretrained-model:", app_configs['base_model'])
 
-model_for_evaluate=''
+model_for_evaluate='202409230028_subtaskA_monolingual_facebook_opt-1.3b'
 
 # Conditional logic for training or evaluating
 if model_for_evaluate:
     print(f"Evaluating model: {model_for_evaluate}")
-    # load_and_evaluate(model_for_evaluate)
-    load_and_evaluate_hf_dataset(model_for_evaluate)
+    load_and_evaluate(model_for_evaluate)
+    # load_and_evaluate_hf_dataset(model_for_evaluate)
 else:
     print("Training a new model...")
     create_and_train()
