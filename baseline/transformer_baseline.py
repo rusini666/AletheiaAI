@@ -1,6 +1,6 @@
 from datasets import Dataset
 import pandas as pd
-import evaluate
+import robustness_testing
 import numpy as np
 from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer, DataCollatorWithPadding, AutoTokenizer, AutoConfig, set_seed
 import os
@@ -34,7 +34,7 @@ def get_data(train_path, test_path, random_seed):
 
 def compute_metrics(eval_pred):
 
-    f1_metric = evaluate.load("f1")
+    f1_metric = robustness_testing.load("f1")
 
     predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=1)
@@ -131,7 +131,7 @@ def test(test_df, model_path, id2label, label2id):
     predictions = trainer.predict(tokenized_test_dataset)
     prob_pred = softmax(predictions.predictions, axis=-1)
     preds = np.argmax(predictions.predictions, axis=-1)
-    metric = evaluate.load("bstrai/classification_report")
+    metric = robustness_testing.load("bstrai/classification_report")
     results = metric.compute(predictions=preds, references=predictions.label_ids)
     
     # return dictionary of classification report

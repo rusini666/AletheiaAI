@@ -2,6 +2,7 @@ import re
 import string
 import json
 from datetime import datetime
+import time
 import types
 import pickle
 import os
@@ -22,6 +23,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
 from sklearn.pipeline import Pipeline
+from sklearn.utils import resample  
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay, precision_recall_fscore_support
 
@@ -34,6 +36,8 @@ import sentencepiece
 
 import nltk
 import ssl
+
+import kagglehub
 
 from datasets import load_dataset
 
@@ -163,11 +167,22 @@ class CustomClassifierBase(nn.Module):
     def __init__(self, pretrained_model):
         super(CustomClassifierBase, self).__init__()
         self.bert = pretrained_model  # Use pretrained DistilBERT directly
+        
+        # Define the layers
+        hidden_size = pretrained_model.config.hidden_size  # Extract hidden size from the model
+        self.fc1 = nn.Linear(hidden_size, 32)  # Adjust the output size as needed
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(32, 1)  # Output size 1 for binary classification
 
     def forward(self, input_ids, attention_mask):
-        # Directly use the logits from the pretrained model
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        return outputs.logits
+        last_hidden_state = outputs[0]               # shape: [batch_size, seq_len, hidden_dim]
+        cls_token_state  = last_hidden_state[:, 0, :]# shape: [batch_size, hidden_dim]
+
+        x = self.fc1(cls_token_state)
+        x = self.relu(x)
+        x = self.fc2(x)
+        return x
 
 class CustomLlamaClassifier(nn.Module):
     def __init__(self, pretrained_model):
@@ -298,30 +313,51 @@ class CustomClassifierBase3Layers(nn.Module):
         return x
 
 class CustomOPTClassifier(nn.Module):
+    """
+    Feed-forward classifier on top of an OPT-like model's final logits.
+    """
     def __init__(self, pretrained_model):
-        super(CustomOPTClassifier, self).__init__()
-
+        super().__init__()
+        print("[DEBUG] Initializing CustomOPTClassifier...")
         self.opt = pretrained_model
-        self.fc1 = nn.Linear(pretrained_model.config.vocab_size, 32)  # Change 2048 to vocab_size (50272)
+        self.fc1 = nn.Linear(pretrained_model.config.vocab_size, 32)
         self.fc2 = nn.Linear(32, 1)
-
         self.relu = nn.ReLU()
-        
+    
     def forward(self, input_ids, attention_mask):
-        # Ensure attention_mask is of the correct shape
-        attention_mask = attention_mask.squeeze(1)
-
-        # The output of OPTForCausalLM is a single tensor of logits
-        opt_out = self.opt(input_ids=input_ids, attention_mask=attention_mask).logits
-
-        # Select the last token's output
-        opt_out = opt_out[:, -1, :]  # Select the last token's output
-
-        x = self.fc1(opt_out)
+        print("[DEBUG] Running classifier forward pass...")
+        start_forward = time.time()
+        
+        # Handle the attention mask dimension issue - ensure it's 2D [batch_size, seq_len]
+        if attention_mask.dim() == 3:
+            attention_mask = attention_mask.squeeze(1)
+        
+        # The base model forward pass
+        opt_outputs = self.opt(input_ids=input_ids, attention_mask=attention_mask)
+        opt_logits = opt_outputs.logits  # Shape: [batch_size, seq_len, vocab_size]
+        
+        # Apply pooling
+        # Create a proper attention mask for pooling (1 for tokens to keep, 0 for padding)
+        mask_expanded = attention_mask.unsqueeze(-1).float()  # [batch_size, seq_len, 1]
+        
+        # Apply the mask and calculate mean only over valid tokens
+        masked_logits = opt_logits * mask_expanded
+        sum_logits = masked_logits.sum(dim=1)  # Sum over sequence dimension
+        
+        # Count valid tokens per sample (avoid division by zero)
+        valid_tokens_per_sample = attention_mask.sum(dim=1, keepdim=True).float().clamp(min=1e-9)
+        
+        # Calculate mean by dividing by the number of valid tokens
+        pooled_logits = sum_logits / valid_tokens_per_sample  # [batch_size, vocab_size]
+        
+        # Pass through classifier head
+        x = self.fc1(pooled_logits)
         x = self.relu(x)
         x = self.fc2(x)
-
-        return x
+        
+        end_forward = time.time()
+        print(f"[DEBUG] Forward pass completed in {end_forward - start_forward:.2f}s")
+        return torch.sigmoid(x)
 
 class DistilbertCustomClassifier(nn.Module):
     def __init__(self,
@@ -485,7 +521,7 @@ def train(model, train_dataset, val_dataset, learning_rate, epochs, model_name):
         # Save best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), os.path.join(app_configs['models_path'], f"{model_name}.pt"))
+            torch.save(model, os.path.join(app_configs['models_path'], f"{model_name}.pt"))
             print("Best model saved.")
 
     # Plot the results
@@ -562,19 +598,24 @@ def get_pretrained_model():
 
 """ For other transformer models """
 # def get_pretrained_model():
-#     """Load the tokenizer and pretrained model."""
-#     print("Loading model and tokenizer...")  # Debug log
+#     """
+#     Load the tokenizer and a base AutoModel (instead of AutoModelForSequenceClassification),
+#     giving you direct access to the last_hidden_state.
+#     """
+#     print("Loading model and tokenizer...")
 
-#     # Load the tokenizer
+#     # 1) Load the tokenizer
 #     tokenizer = AutoTokenizer.from_pretrained(app_configs['base_model'])
+    
+#     # Ensure we have a pad_token if needed
 #     if tokenizer.pad_token is None:
 #         tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
 
-#     # Use AutoModelForSequenceClassification for classification tasks
+#     # 2) Load the base transformer model (AutoModel),
+#     #    *not* AutoModelForSequenceClassification
 #     pretrained_model = AutoModelForSequenceClassification.from_pretrained(
 #         app_configs['base_model'],
-#         num_labels=1,  # Binary classification
-#         ignore_mismatched_sizes=True  # Ignore size mismatches during weight loading
+#         ignore_mismatched_sizes=True  # optional, if needed
 #     )
 
 #     return tokenizer, pretrained_model
@@ -657,27 +698,42 @@ def load_and_evaluate(model_name=''):
     _, _, test_df = get_train_val_test_data(app_configs['full_dataset_path'])
     test_df = test_df.drop(["model", "source"], axis=1, errors='ignore')
 
-    # Set the device
-    device = target_device()
+    # Set the device (MPS if available, otherwise CPU)
+    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+    app_configs['device'] = device  # ✅ Ensure device is set in app_configs
+    print(f"Using device: {device}")
 
-    # Load tokenizer and model
+    # Load tokenizer and base model
     tokenizer, pretrained_model = get_pretrained_model()
 
-    # Create classifier
-    classifierClass = str_to_class(app_configs['classifier'])
-    model = classifierClass(pretrained_model)
+    # Initialize OPT classifier
+    model = CustomOPTClassifier(pretrained_model)
 
-    # Load model weights and move to device
+    # Load model weights
     model_path = os.path.join(app_configs['models_path'], f"{app_configs['model_name']}.pt")
-    # Force CPU load
-    model.load_state_dict(
-        torch.load(model_path, map_location=torch.device('cpu'))
-    )
 
-    # Then move the model to MPS
-    model = model.to(torch.device("mps"))
-    print(f"Model loaded successfully from: {model_path}")
-    model = model.to(torch.device("mps")).float()
+    try:
+        # Try loading the full model first
+        model = torch.load(model_path, map_location="cpu")
+        if isinstance(model, torch.nn.Module):
+            print("✅ Loaded full model successfully.")
+        else:
+            raise ValueError("Loaded object is not a model, assuming state_dict.")
+    except Exception as e:
+        print(f"⚠️ Full model load failed. Trying to load state_dict instead. Error: {e}")
+
+        # If loading the full model fails, assume it's a state_dict and load accordingly
+        model = CustomOPTClassifier(pretrained_model)  # Initialize the model structure
+        state_dict = torch.load(model_path, map_location="cpu")
+        model.load_state_dict(state_dict)
+        print("✅ Loaded model state_dict successfully.")
+
+    # Move model to device (MPS/CPU)
+    model = model.to(device).float()
+    print(f"✅ Model moved to device: {device}")
+
+    # ✅ Ensure `app_configs['device']` is set before passing to get_text_predictions()
+    app_configs['device'] = device  
 
     # Create DataLoader
     test_dataset = PreprocessDataset(test_df, tokenizer)
@@ -695,73 +751,13 @@ def load_and_evaluate(model_name=''):
         merged_df['label_gold'], merged_df['label_pred'], average='weighted'
     )
 
-    print(f"Accuracy: {accuracy}")
-    print(f"Precision: {precision}")
-    print(f"Recall: {recall}")
-    print(f"F1-Score: {f1}")
+    print(f"\n🔹 **Evaluation Metrics:**")
+    print(f"✅ Accuracy: {accuracy:.4f}")
+    print(f"✅ Precision: {precision:.4f}")
+    print(f"✅ Recall: {recall:.4f}")
+    print(f"✅ F1-Score: {f1:.4f}\n")
     print(classification_report(merged_df['label_gold'], merged_df['label_pred']))
 
-    if not model_name:
-        save_app_options()
-
-def load_and_evaluate_hf_dataset(model_name=''):
-    # Set model name if provided
-    if model_name:
-        app_configs['model_name'] = model_name
-
-    # Load the Hugging Face dataset (only 'train' split is available)
-    dataset = load_dataset("artem9k/ai-text-detection-pile", split='train')
-    df = pd.DataFrame(dataset) 
-
-    # Convert `source` to binary labels: 0 for human, 1 for AI-generated
-    df['label'] = df['source'].apply(lambda x: 1 if x == 'ai' else 0)
-
-    # Sample only 10% of the data for evaluation
-    df = df.sample(frac=0.1, random_state=42).reset_index(drop=True)
-
-    # Only use test_df for evaluation
-    test_df = df[['id', 'text', 'label']]
-
-    # Initialize the model and tokenizer
-    target_device()
-    tokenizer, pretrained_model = get_pretrained_model()
-
-    # Recreate the model architecture
-    classifierClass = str_to_class(app_configs['classifier'])
-    model = classifierClass(pretrained_model)
-
-    # Load the saved model
-    model_path = os.path.join(app_configs['models_path'], app_configs['model_name'] + ".pt")
-    model.load_state_dict(torch.load(model_path, map_location=app_configs['device']))
-    print("Model loaded successfully from:", model_path)
-
-    # Move the model to the correct device
-    model = model.to(app_configs['device'])
-
-    # Prepare DataLoader for Hugging Face dataset
-    test_dataloader = DataLoader(PreprocessDataset(test_df, tokenizer), batch_size=8, shuffle=False, num_workers=0)
-
-    # Add these print statements to check total samples and batches
-    print("Total samples in test_dataloader:", len(test_dataloader.dataset))
-    print("Total batches in test_dataloader:", len(test_dataloader))
-
-    # Generate predictions
-    predictions_df = pd.DataFrame({'id': test_df['id']})
-    predictions_df['label'] = get_text_predictions(model, test_dataloader)
-
-    # Calculate metrics
-    merged_df = predictions_df.merge(test_df, on='id', suffixes=('_pred', '_gold'))
-    accuracy = accuracy_score(merged_df['label_gold'], merged_df['label_pred'])
-    precision, recall, f1, _ = precision_recall_fscore_support(merged_df['label_gold'], merged_df['label_pred'], average='weighted')
-
-    # Print metrics
-    print("Accuracy:", accuracy)
-    print("Precision:", precision)
-    print("Recall:", recall)
-    print("F1-Score:", f1)
-    print(classification_report(merged_df['label_gold'], merged_df['label_pred']))
-
-    # Optionally display the confusion matrix
     cm = confusion_matrix(merged_df['label_gold'], merged_df['label_pred'])
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
     disp.plot(cmap=plt.cm.Blues)
@@ -770,6 +766,315 @@ def load_and_evaluate_hf_dataset(model_name=''):
 
     if not model_name:
         save_app_options()
+
+def load_and_evaluate_hc3(model_name=''):
+    """
+    Evaluate the primary (OPT) model on 30% of the Hello-SimpleAI/HC3 dataset.
+    """
+
+    # 1) Optionally override model_name
+    if model_name:
+        app_configs['model_name'] = model_name
+
+    # 2) Load the full HC3 dataset (choose a specific split if needed, e.g. 'train')
+    dataset_dict = load_dataset("Hello-SimpleAI/HC3", "all")
+    train_dataset = dataset_dict["train"]
+
+    # 3) Shuffle and select 30% of the data
+    train_dataset = train_dataset.shuffle(seed=42)
+    sample_size = int(0.3 * len(train_dataset))
+    train_dataset = train_dataset.select(range(sample_size))
+
+    
+    # 4) Convert to a pandas DataFrame
+    df = pd.DataFrame(train_dataset)
+
+    # 5) Expand each row:
+    #    - for every string in human_answers => label=0 (human)
+    #    - for every string in chatgpt_answers => label=1 (AI)
+    new_rows = []
+    for i, row in df.iterrows():
+        for hum in row["human_answers"]:
+            new_rows.append({
+                "id":     row["id"],
+                "text":   hum,
+                "label":  0
+            })
+        for chatgpt in row["chatgpt_answers"]:
+            new_rows.append({
+                "id":     row["id"],
+                "text":   chatgpt,
+                "label":  1
+            })
+    # Now you have a list of expanded rows:
+    expanded_df = pd.DataFrame(new_rows)
+
+    # 6) Prepare for inference
+    device = target_device()
+
+    # Load tokenizer & model
+    tokenizer, pretrained_model = get_pretrained_model()
+    
+    # Build the classifier (e.g. CustomOPTClassifier)
+    classifierClass = str_to_class(app_configs['classifier'])
+    model = classifierClass(pretrained_model)
+
+    # Load your saved model checkpoint
+    model_path = os.path.join(app_configs['models_path'], f"{app_configs['model_name']}.pt")
+    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    print(f"Model loaded successfully from: {model_path}")
+
+    model = model.to(device).float()
+
+    # Create a Dataset and DataLoader
+    test_dataset = PreprocessDataset(expanded_df, tokenizer)
+    test_dataloader = DataLoader(test_dataset, batch_size=8, shuffle=False)
+
+    # 7) Generate predictions (0 or 1)
+    predictions = get_text_predictions(model, test_dataloader)
+
+    # 8) Evaluate
+    # Build a merged DataFrame with gold labels vs. predicted labels
+    merged_df = pd.DataFrame({
+        'id':         expanded_df['id'],
+        'label_gold': expanded_df['label'],
+        'label_pred': predictions
+    })
+
+    accuracy = accuracy_score(merged_df['label_gold'], merged_df['label_pred'])
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        merged_df['label_gold'], merged_df['label_pred'], average='weighted'
+    )
+
+    print(f"Number of expanded samples: {len(expanded_df)}")
+    print(f"Accuracy: {accuracy:.3f}")
+    print(f"Precision: {precision:.3f}")
+    print(f"Recall: {recall:.3f}")
+    print(f"F1-Score: {f1:.3f}")
+    print("\n", classification_report(merged_df['label_gold'], merged_df['label_pred'], digits=3))
+
+    # Optionally, show confusion matrix
+    cm = confusion_matrix(merged_df['label_gold'], merged_df['label_pred'])
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
+    disp.plot(cmap=plt.cm.Blues)
+    plt.title('Confusion Matrix (HC3 Evaluation)')
+    plt.show()
+
+def load_and_evaluate_aitextpile(model_name=''):
+    """
+    Evaluate your primary (OPT) model on 5% of the artem9k/ai-text-detection-pile dataset,
+    but create a balanced subset for evaluation (50% human / 50% AI).
+    """
+
+    # 1) Optionally override model_name
+    if model_name:
+        app_configs['model_name'] = model_name
+
+    # 2) Load the dataset's 'train' split (the only split)
+    dataset = load_dataset("artem9k/ai-text-detection-pile", split="train")
+
+    # 3) Shuffle and take 5% of the data (~69.5k rows from 1.39M)
+    dataset = dataset.shuffle(seed=42)
+    sample_size = int(0.05 * len(dataset))  # 5%
+    dataset = dataset.select(range(sample_size))
+    print(f"Selected {sample_size} samples out of {len(dataset)} from 'train' split.")
+
+    # 4) Convert to a pandas DataFrame
+    df = pd.DataFrame(dataset)
+
+    # 5) Validate the dataset
+    # Check unique values in 'source' column
+    print(f"Unique 'source' values: {df['source'].unique()}")
+    # Ensure label mapping is consistent
+    df["label"] = df["source"].apply(lambda s: 1 if s == "ai" else 0)
+    print(f"Label distribution: \n{df['label'].value_counts()}")
+
+    # Check if the dataset is balanced
+    if abs(df["label"].value_counts(normalize=True).diff().iloc[1]) > 0.1:
+        print("Warning: Dataset is imbalanced. We'll create a balanced subset for evaluation.")
+
+    # 6) Create a balanced subset (50% human, 50% AI)
+
+    desired_sample_size = sample_size  # e.g., 69,626
+    half_of_dataset = desired_sample_size // 2
+
+    df_human = df[df["label"] == 0]
+    df_ai    = df[df["label"] == 1]
+
+    # Check if there are enough samples in each class; if not, allow oversampling
+    use_replace_human = (len(df_human) < half_of_dataset)
+    use_replace_ai    = (len(df_ai)    < half_of_dataset)
+
+    df_human_balanced = resample(
+        df_human,
+        replace=use_replace_human,
+        n_samples=half_of_dataset,
+        random_state=42
+    )
+
+    df_ai_balanced = resample(
+        df_ai,
+        replace=use_replace_ai,
+        n_samples=half_of_dataset,
+        random_state=42
+    )
+
+    # Combine and shuffle
+    df_balanced = pd.concat([df_human_balanced, df_ai_balanced]).sample(frac=1, random_state=42)
+
+    print(f"Balanced sample size: {len(df_balanced)}")
+    print(f"Label distribution in balanced subset: \n{df_balanced['label'].value_counts()}")
+
+    # 7) Prepare for inference
+    device = target_device()                 # e.g., GPU, MPS, or CPU
+    tokenizer, pretrained_model = get_pretrained_model()  # e.g., your CustomOPT
+    classifierClass = str_to_class(app_configs['classifier'])
+    model = classifierClass(pretrained_model)
+
+    # 8) Load your saved model checkpoint (already trained)
+    model_path = os.path.join(
+        app_configs['models_path'], 
+        f"{app_configs['model_name']}.pt"
+    )
+    model.load_state_dict(
+        torch.load(model_path, map_location="cpu")
+    )
+    print(f"Model loaded successfully from: {model_path}")
+    model = model.to(device).float()
+
+    # 9) Create a Dataset/DataLoader from the balanced subset
+    test_dataset = PreprocessDataset(df_balanced, tokenizer)
+    test_dataloader = DataLoader(test_dataset, batch_size=8, shuffle=False)
+
+    # 10) Generate predictions (0 or 1)
+    predictions = get_text_predictions(model, test_dataloader)
+
+    # Debugging predictions
+    print("Sample predictions:")
+    for text, gold_label, pred_label in zip(df_balanced["text"][:5], df_balanced["label"][:5], predictions[:5]):
+        print(f"Text: {text[:100]}...\nGold: {gold_label}, Pred: {pred_label}\n")
+
+    # 11) Evaluate
+    merged_df = pd.DataFrame({
+        "id":         df_balanced["id"],
+        "label_gold": df_balanced["label"],
+        "label_pred": predictions
+    })
+
+    # Basic metrics
+    accuracy = accuracy_score(merged_df['label_gold'], merged_df['label_pred'])
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        merged_df['label_gold'], 
+        merged_df['label_pred'], 
+        average='weighted'
+    )
+
+    print(f"Evaluating on {len(merged_df)} balanced samples (artem9k/ai-text-detection-pile).")
+    print(f"Accuracy:  {accuracy:.3f}")
+    print(f"Precision: {precision:.3f}")
+    print(f"Recall:    {recall:.3f}")
+    print(f"F1-Score:  {f1:.3f}")
+    print("\n", classification_report(
+        merged_df['label_gold'], 
+        merged_df['label_pred'], 
+        digits=3
+    ))
+
+    # Confusion matrix
+    cm = confusion_matrix(
+        merged_df['label_gold'], 
+        merged_df['label_pred'], 
+        labels=[0, 1]  # Ensure the labels match the dataset
+    )
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Human", "AI"])
+    disp.plot(cmap=plt.cm.Blues)
+    plt.title('Confusion Matrix (Balanced ai-text-detection-pile Evaluation)')
+    plt.show()
+
+def evaluate_human_vs_llm_corpus(model_name=''):
+    """
+    Evaluate an OPT model on the 'Human vs LLM Text Corpus' dataset from Kaggle.
+    - Uses only 30% of the dataset
+    - Ensures balanced labels (50% human, 50% AI)
+    """
+
+    # 1) Download the dataset
+    print("Downloading Kaggle dataset...")
+    dataset_path = kagglehub.dataset_download("starblasters8/human-vs-llm-text-corpus")
+    dataset_file = os.path.join(dataset_path, "data.csv")  # Adjust filename if needed
+
+    # 2) Load the dataset
+    print("Loading dataset into DataFrame...")
+    df = pd.read_csv(dataset_file)
+
+    # 3) Ensure 'source' column exists
+    if "source" not in df.columns:
+        raise KeyError("The dataset does not contain a 'source' column. Check dataset structure.")
+
+    # 4) Map labels: 0 = Human, 1 = AI
+    df["label"] = df["source"].apply(lambda s: 0 if s == "Human" else 1)
+
+    print(f"Dataset loaded with {len(df)} samples.")
+    print(f"Original Label distribution:\n{df['label'].value_counts()}")
+
+    # 5) Select a balanced 30% subset
+    sample_size = int(0.3 * len(df))  # 30% of total dataset
+    half_sample = sample_size // 2    # 50% Human, 50% AI
+
+    df_human = df[df["label"] == 0]
+    df_ai = df[df["label"] == 1]
+
+    # Ensure we have enough samples per class, otherwise oversample
+    df_human_sample = resample(df_human, n_samples=half_sample, random_state=42, replace=(len(df_human) < half_sample))
+    df_ai_sample = resample(df_ai, n_samples=half_sample, random_state=42, replace=(len(df_ai) < half_sample))
+
+    df_balanced = pd.concat([df_human_sample, df_ai_sample]).sample(frac=1, random_state=42)  # Shuffle
+
+    print(f"Balanced subset selected with {len(df_balanced)} samples.")
+    print(f"Balanced Label distribution:\n{df_balanced['label'].value_counts()}")
+
+    # 6) Load tokenizer & model
+    device = target_device()
+    tokenizer, pretrained_model = get_pretrained_model()
+
+    classifierClass = str_to_class(app_configs['classifier'])
+    model = classifierClass(pretrained_model)
+
+    # 7) Load trained model
+    model_path = os.path.join(app_configs['models_path'], f"{model_name}.pt")
+    print(f"Loading model from {model_path}...")
+
+    model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    model = model.to(device).float()
+
+    # 8) Create a Dataset and DataLoader
+    test_dataset = PreprocessDataset(df_balanced, tokenizer)
+    test_dataloader = DataLoader(test_dataset, batch_size=8, shuffle=False)
+
+    # 9) Generate predictions
+    print("Generating predictions...")
+    predictions = get_text_predictions(model, test_dataloader)
+
+    # 10) Evaluate
+    merged_df = pd.DataFrame({
+        'id': df_balanced.index,
+        'label_gold': df_balanced['label'],
+        'label_pred': predictions
+    })
+
+    accuracy = accuracy_score(merged_df['label_gold'], merged_df['label_pred'])
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        merged_df['label_gold'], merged_df['label_pred'], average='weighted'
+    )
+
+    print(f"Evaluation on Kaggle Human vs LLM Corpus (Balanced 30% Sample):")
+    print(f"Accuracy:  {accuracy:.3f}")
+    print(f"Precision: {precision:.3f}")
+    print(f"Recall:    {recall:.3f}")
+    print(f"F1-Score:  {f1:.3f}")
+    print("\n", classification_report(merged_df['label_gold'], merged_df['label_pred'], digits=3))
+
+    return merged_df
 
 def load_app_options(model_name):
     options = pd.read_json(train_path, lines=True)
@@ -859,29 +1164,34 @@ app_configs = default_configs.copy()
 app_configs.update(opt_model_configs)
 
 app_configs['model_name'] = app_configs['timestamp_prefix'] + "_" + app_configs['task'] + "_" + app_configs['base_model'].replace("/", "_")
+# app_configs['model_name'] = "202409230028_subtaskA_monolingual_facebook_opt-1.3b"
 app_configs['prediction_path'] = absolute_path + '/predictions/' + app_configs['model_name'] + '.predictions.jsonl'
 app_configs['options_path'] = absolute_path + '/predictions/'  + app_configs['model_name'] + '.options.jsonl'
 app_configs['results_path'] = absolute_path + '/predictions/'  + app_configs['model_name'] + '.results.jsonl'
 
 print("Working on pretrained-model:", app_configs['base_model'])
 
-model_for_evaluate='202409230028_subtaskA_monolingual_facebook_opt-1.3b'
+model_for_evaluate=''
+# 202409230028_subtaskA_monolingual_facebook_opt-1.3b
 
-# Conditional logic for training or evaluating
-if model_for_evaluate:
-    print(f"Evaluating model: {model_for_evaluate}")
-    load_and_evaluate(model_for_evaluate)
-    # load_and_evaluate_hf_dataset(model_for_evaluate)
-else:
-    print("Training a new model...")
-    create_and_train()
+# ✅ Fix: Prevent automatic execution when imported
+if __name__ == "__main__":
+    if model_for_evaluate:
+        print(f"Evaluating model: {model_for_evaluate}")
+        # load_and_evaluate(model_for_evaluate)
+        # evaluate_human_vs_llm_corpus(model_for_evaluate)
+        # load_and_evaluate_aitextpile(model_for_evaluate)
+        # load_and_evaluate_hc3(model_for_evaluate)
+    else:
+        print("Training a new model...")
+        create_and_train()
 
-end_now = datetime.now()
-end_time = end_now.strftime("%Y-%m-%d %H-%M")
-print("process finished at:", end_time)
-running_time = (end_now - start_now).total_seconds()
-app_configs['start_time'] = start_time
-app_configs['end_time'] = end_time
-app_configs['running_time'] = running_time
-if (model_for_evaluate == ''): 
-    save_app_options()
+    end_now = datetime.now()
+    end_time = end_now.strftime("%Y-%m-%d %H-%M")
+    print("process finished at:", end_time)
+    running_time = (end_now - start_now).total_seconds()
+    app_configs['start_time'] = start_time
+    app_configs['end_time'] = end_time
+    app_configs['running_time'] = running_time
+    if (model_for_evaluate == ''): 
+        save_app_options()
